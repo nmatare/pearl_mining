@@ -2,6 +2,7 @@
 # v4: why does the Dolphin worker sit after "selected GPUs"?
 exec 2>&1
 echo "== v4 $(date -u +%T)"
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl procps iproute2 >/dev/null 2>&1; which curl ss pgrep strace
 ps -eo pid,ppid,etime,stat,pcpu,rss,cmd --sort=start_time | cut -c1-200 | head -30
 echo "--- sockets"; (ss -tnp 2>/dev/null || netstat -tnp 2>/dev/null) | head -20
 W=$(pgrep -f dolphinpod-worker | head -1); echo "worker pid=$W"
