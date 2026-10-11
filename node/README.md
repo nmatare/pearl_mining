@@ -59,6 +59,10 @@ see the node only through their own telemetry (pool API, dashboards) or the loca
 ### Pearl driver
 SRBMiner-MULTI `--algorithm pearlhash --disable-cpu --disable-gpu-amd --gpu-sensors-disable --pool $PEARL_POOL --wallet <PEARL_WALLET>.<worker> --api-enable --api-port 21550 ... --max-no-share-sent 900`, no overclock flags. `PEARL_EXTRA_ARGS` appends. `useful` mode runs nothing (the vLLM plugin lives in the inference process) and reports no hashrate. Stats come from the miner's local JSON API through a tolerant parser (layout unverified until the first GPU run).
 
+### Cold start (minutes, not 30)
+- The miner starts at boot (`BG_START_DELAY_S` 0) and keeps the whole GPU until the Dolphin worker is `running` (connected); only then does the load-based balancing apply.
+- Before the worker starts, `prefetch.py` fetches the 5.5 GB runtime bundle (sha256-checked, placed beside the worker binary with a `.sha256` sidecar; skipped if `/opt/dolphinpod/runtimes` already holds its marker) and the model (Hugging Face cache layout under `$XDG_CACHE_HOME/huggingface/hub`, every blob verified, linked from the other places the worker might look) in parallel over many ranged connections. Model: `DOLPHIN_MODEL`, else the config's `model`, and for `auto` `DOLPHIN_AUTO_MODEL` (default `unsloth/Qwen3.8-27B-NVFP4`). Knobs: `DOLPHIN_PREFETCH=0` (off), `DOLPHIN_RUNTIME_URL`, `DOLPHIN_PREFETCH_WAIT_S` (600), `DOLPHIN_PREFETCH_RUNTIME_CONNS` (8), `DOLPHIN_PREFETCH_MODEL_CONNS` (12 per file), `HF_ENDPOINT`, `HF_TOKEN`. A failed or slow prefetch only means the worker downloads for itself, as before.
+
 ### Dolphin driver
 The worker is a closed per-key installer with no public image (research/dolphin_node.md), so it is not in the image. Sources, first
 match wins: `DOLPHIN_WORKER_CMD` (a command line, e.g. a binary baked into a derived image); `DOLPHIN_BOOTSTRAP` / `DOLPHIN_WORKER_URL`

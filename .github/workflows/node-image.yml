@@ -11,6 +11,5 @@ jobs:
         with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
       - run: |
           V=$(cat node/VERSION)
-          for arch in ampere-ada blackwell; do
-            docker buildx build --platform linux/amd64 --build-arg PM_ARCH=$arch -t ghcr.io/nmatare/pearl-node:$V-$arch -f node/Dockerfile --push node
-          done
+          docker buildx build --platform linux/amd64 --build-arg PM_ARCH=ampere-ada --build-arg CUDA_TAG=12.2.2 --build-arg CUDA_PKG=12-2 -t ghcr.io/nmatare/pearl-node:$V-ampere-ada -f node/Dockerfile --push node
+          docker buildx build --platform linux/amd64 --build-arg PM_ARCH=blackwell --build-arg CUDA_TAG=12.8.1 --build-arg CUDA_PKG=12-8 -t ghcr.io/nmatare/pearl-node:$V-blackwell -f node/Dockerfile --push node

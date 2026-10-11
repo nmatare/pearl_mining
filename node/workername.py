@@ -1,6 +1,6 @@
 """Pool worker names. Stdlib only: node/agent.py carries a verbatim copy (tests keep both in step).
 
-Scheme: <prefix><id> where prefix is the provider's 2-3 letter tag (salad sa, vast va, fake fk, fake2 f2) and id is the
+Scheme: <prefix><id> where prefix is the provider's 2-3 letter tag (salad sa, vast va) and id is the
 machine/instance id lowercased with everything but [a-z0-9] removed, truncated so the whole name is <= MAX_LEN.
 Pearl's pool (Kryptex) accepts [A-Za-z0-9]{1,32}; we stay at 30 to leave room for a pool-side suffix.
 """
