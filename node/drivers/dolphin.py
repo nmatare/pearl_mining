@@ -56,6 +56,7 @@ import socket
 import stat
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -130,6 +131,55 @@ def parse_worker_config(b64: str) -> dict:
         raise ValueError(f"{CONFIG_ENV} has no api_key")
     cfg.pop("worker_id", None)  # lighthouse assigns one per machine on first registration
     return cfg
+
+
+_SECRETISH = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CONFIG_B64|WALLET|BOOTSTRAP)", re.I)
+_BACKEND_NAMES = ("aphrodite", "sonar")  # the engine in the runtime bundle (v2.4.3: `bin/aphrodite serve <model> --uds ...`)
+
+
+def find_backend(proc_root: str = "/proc") -> tuple[list[str], dict[str, str]] | None:
+    """argv and environment of the worker's inference engine, if one is running. The worker hides the engine's stderr
+    ("inference backend exited: exit status 1"), so the driver keeps a copy of how it was started and can run it
+    again on failure to see why (replay_backend). Secret-looking variables are dropped from the copy."""
+    try:
+        pids = [d for d in os.listdir(proc_root) if d.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(f"{proc_root}/{pid}/cmdline", "rb") as f:
+                argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if "serve" not in argv or "--uds" not in argv or not any(os.path.basename(a) in _BACKEND_NAMES for a in argv[:3]):
+            continue
+        try:
+            with open(f"{proc_root}/{pid}/environ", "rb") as f:
+                raw = f.read().split(b"\0")
+        except OSError:
+            raw = []
+        env = {k.decode("utf-8", "replace"): v.decode("utf-8", "replace")
+               for k, _, v in (x.partition(b"=") for x in raw if b"=" in x)}
+        return argv, {k: v for k, v in env.items() if not _SECRETISH.search(k)}
+    return None
+
+
+def replay_backend(argv: list[str], env: dict[str, str], timeout: float, tmp_root: str = "/tmp",
+                   run=subprocess.run) -> tuple[object, list[str]]:
+    """Run the captured engine command again with its output visible. (returncode or 'timeout', last output lines)."""
+    import tempfile
+    sock_dir = tempfile.mkdtemp(prefix="dpdbg-", dir=tmp_root)
+    cmd = [re.sub(r"/tmp/dp-[^/\s]+/", sock_dir + "/", a) for a in argv]
+    try:
+        p = run(cmd, env=env, capture_output=True, text=True, errors="replace", timeout=timeout, start_new_session=True)  # noqa: S603
+        rc, out = p.returncode, (p.stdout or "") + "\n" + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:  # it stayed up: the engine can start when the GPU is free
+        def txt(x):
+            return x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
+        rc, out = "timeout", txt(e.stdout) + "\n" + txt(e.stderr)
+    except OSError as e:
+        rc, out = "error", f"cannot run {cmd[0]}: {e}"
+    return rc, [ln.rstrip()[:400] for ln in out.splitlines() if ln.strip()][-80:]
 
 
 class _UnixConnection(http.client.HTTPConnection):
@@ -238,6 +288,16 @@ class Driver(ProcessDriver):
         self.fresh_machine_id = (env.get("DOLPHIN_FRESH_MACHINE_ID") or "1").strip().lower() not in ("0", "false", "no")
         self.socket_glob = env.get("DOLPHIN_SONAR_SOCKET") or DEFAULT_SOCKET_GLOB
         self.requests: dict[str, int] = {}
+        # The worker hides its engine's stderr. A tap copies the engine's argv/env while it runs; when the worker dies of
+        # "inference backend exited", the engine is run once more (DOLPHIN_BACKEND_REPLAY_S, 0 = off) and its last lines
+        # are logged as "dolphin-backend: ..." and put into the failure reason.
+        self.replay_s = float(env.get("DOLPHIN_BACKEND_REPLAY_S") or "90")
+        self.proc_root = env.get("DOLPHIN_PROC_ROOT") or "/proc"
+        self._backend: tuple[list[str], dict[str, str]] | None = None
+        self._replay_thread: threading.Thread | None = None
+        self._replays = 0
+        self._replayed_for = None
+        self.backend_error = ""
         self._diag_at = 0.0
         self._diag_every_s = float(env.get("DOLPHIN_DIAG_EVERY_S") or "60")
         self._metrics_seen: str | None = None  # last reported state of the engine's metrics, to log changes only
@@ -252,6 +312,9 @@ class Driver(ProcessDriver):
         elif self.config_b64:
             try:
                 self.config = parse_worker_config(self.config_b64)
+                pick = (env.get("DOLPHIN_MODEL") or "").strip()  # the controller's pick for this card (networks/dolphin.py)
+                if pick and pick.lower() != "auto":
+                    self.config["model"] = pick
                 self.kind = "config"
                 if "DOLPHIN_CONNECT_TIMEOUT_S" not in env:  # runtime bundle + model download: far longer than a link install
                     self.connect_timeout_s = 3600.0
@@ -425,11 +488,18 @@ class Driver(ProcessDriver):
                 else:
                     raise
             self._await_prefetch(cancel)
+            rt = self._replay_thread
+            if rt is not None and rt.is_alive():  # a replay of the engine owns the GPU for a moment
+                rt.join(self.replay_s + 15)
             with self._lock:
                 if cancel.is_set():
                     return
                 self.phase = "run" if direct else "install"
+                self._backend = None
+                self.backend_error = ""
                 self._spawn(self.command())
+            if self.kind == "config":
+                threading.Thread(target=self._tap_backend, args=(self.proc, cancel), daemon=True).start()
             self._watch_cache(cancel)
         except (DriverError, Unsupported) as e:
             if cancel.is_set():  # superseded by a newer start(): its state is not ours to overwrite
@@ -553,6 +623,36 @@ class Driver(ProcessDriver):
         except OSError as e:
             raise DriverError(f"download failed: cannot save the worker: {e.strerror or e}") from e
 
+    def _tap_backend(self, proc, cancel: threading.Event) -> None:
+        """Thread: while the worker runs, remember how it started its engine."""
+        while proc.poll() is None and not cancel.is_set():
+            found = find_backend(self.proc_root)
+            if found:
+                if self._backend is None:
+                    argv, _ = found
+                    print("dolphin: engine command: " + self.redact(" ".join(argv))[:1500], flush=True)
+                self._backend = found
+                return
+            time.sleep(0.2)
+
+    def _replay(self) -> None:
+        argv, env = self._backend  # type: ignore[misc]
+        print(f"dolphin: the worker hides its engine's errors; running the engine once more for up to {self.replay_s:.0f}s", flush=True)
+        rc, lines = replay_backend(argv, env, self.replay_s)
+        for ln in lines:
+            print(f"dolphin-backend: {self.redact(ln, urls=False)}", flush=True)
+        err = [ln for ln in lines if re.search(r"error|exception|fail|cannot|unsupported|not support|out of memory|no kernel|assert", ln, re.I)]
+        pick = (err or lines)[-2:]
+        self.backend_error = self.redact(" | ".join(x.strip()[:200] for x in pick), urls=False) if rc != "timeout" else ""
+        print(f"dolphin: engine replay finished ({rc})", flush=True)
+
+    def _maybe_replay(self) -> None:
+        if (self.replay_s > 0 and self._backend and self._replays < 2 and self.kind == "config"
+                and "inference backend exited" in " ".join(self._tail)):
+            self._replays += 1
+            self._replay_thread = threading.Thread(target=self._replay, daemon=True)
+            self._replay_thread.start()
+
     def alive(self) -> bool:
         with self._lock:
             if self.parked or self._installing():
@@ -564,6 +664,9 @@ class Driver(ProcessDriver):
             if rc is None:
                 return True
             self.exit_code = rc
+            if self._replayed_for is not p:  # once per exit of the worker
+                self._replayed_for = p
+                self._maybe_replay()
             # An installer that exits 0 and leaves the worker binary behind: run that binary next.
             if (self.phase == "install" and rc == 0 and not self._cancel.is_set() and os.path.isfile(self.dest)
                     and os.access(self.dest, os.X_OK)):
@@ -609,7 +712,8 @@ class Driver(ProcessDriver):
         known = explain_exit(" ".join(list(self._tail)[-12:])) if self.phase == "install" else None
         if known:
             return known + (f" (exit code {rc})" if rc is not None else "")
-        return super().exit_reason().replace("dolphin ", "worker ", 1)
+        base = super().exit_reason().replace("dolphin ", "worker ", 1)
+        return base + (f"; engine said: {self.backend_error}" if self.backend_error else "")
 
     def health(self) -> dict:
         """{'state': installing|starting|running|failed, 'reason': str, 'evidence': [str]}. Never says running without evidence."""

@@ -218,7 +218,10 @@ class PrefetchConfig:
 
     def link_homes(self) -> list[str]:
         """Other places the worker might use as HF_HOME (unconfirmed), all pointing at the one real cache."""
-        c = [os.path.join(self.cache_home, "dolphinpod", "huggingface"), os.path.join(self.cache_home, "dolphinpod", "hf"),
+        # v2.4.3 [V, read from the engine's environment on a live node]: HOME = HF_HOME = XDG_CACHE_HOME =
+        # <XDG_CACHE_HOME>/dolphinpod-worker/cache, so the worker looks for models in <that>/hub.
+        c = [os.path.join(self.cache_home, "dolphinpod-worker", "cache"),
+             os.path.join(self.cache_home, "dolphinpod", "huggingface"), os.path.join(self.cache_home, "dolphinpod", "hf"),
              os.path.join(self.cache_home, "hf"), os.path.join(self.home, ".cache", "huggingface"),
              os.path.join(self.home, "huggingface"), *self.extra_homes]
         return [p for p in dict.fromkeys(c) if p != self.hf_home]
