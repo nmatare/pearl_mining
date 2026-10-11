@@ -1,32 +1,23 @@
 #!/bin/bash
+# v2 (runs after v1 has finished): which SRBMiner invocation triggers "Unsupported runtime environment"?
 exec 2>&1
 S=/opt/srb/SRBMiner-MULTI
-W="${PEARL_WALLET}.dbgtest"
-ARGS="--algorithm pearlhash --disable-cpu --disable-gpu-amd --pool prl.kryptex.network:7048 --wallet $W --password x"
-run() { # label, command...
-  local l="$1"; shift; echo "--- $l"; "$@" > /tmp/o.txt 2>&1; echo "rc=$?"; head -c 1500 /tmp/o.txt; echo
+W="${PEARL_WALLET}.dbgtest2"
+BASE="--algorithm pearlhash --disable-cpu --disable-gpu-amd --pool prl.kryptex.network:7048 --wallet $W --password x"
+try() { # label, prefix-cmd, args...
+  local l="$1" pre="$2"; shift 2
+  echo "--- $l"
+  $pre $S "$@" > /tmp/v.txt 2>&1 &
+  local p=$!
+  sleep 15
+  if kill -0 $p 2>/dev/null; then echo "ALIVE after 15 s"; else wait $p; echo "EXITED rc=$?"; fi
+  head -c 1200 /tmp/v.txt
+  pkill -f SRBMiner-MULTI; sleep 2
 }
-echo "== srbminer experiments"
-grep -m1 -E "model name" /proc/cpuinfo; grep -m1 -o -w hypervisor /proc/cpuinfo; cat /sys/class/dmi/id/product_name 2>&1 | head -1
-echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-run "list-devices plain" $S --list-devices
-run "list-devices no LD_LIBRARY_PATH" env -u LD_LIBRARY_PATH $S --list-devices
-run "list-devices under timeout" timeout 20 $S --list-devices
-(timeout 25 $S $ARGS > /tmp/o2.txt 2>&1; echo "rc=$?" >> /tmp/o2.txt) ; echo "--- mine 25 s plain"; head -c 2500 /tmp/o2.txt
-echo "--- cuda libs present?"; ldconfig -p | grep -E "libcuda|libnvrtc|libcudart|libnvidia-ml" | head
-echo "== install nvrtc/cudart and retry"
-apt-get update -qq 2>&1 | tail -1
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cuda-nvrtc-12-8 cuda-cudart-12-8 2>&1 | tail -2
-ldconfig; ldconfig -p | grep -E "libnvrtc|libcudart" | head -4
-(timeout 25 $S $ARGS > /tmp/o3.txt 2>&1; echo "rc=$?" >> /tmp/o3.txt) ; echo "--- mine 25 s after nvrtc"; head -c 2500 /tmp/o3.txt
-echo "== sonar"
-R=/opt/dolphinpod/runtimes/text-v
-for i in $(seq 1 80); do [ -e $R/run-sonar ] && break; sleep 5; done
-sleep 20
-ls -la $R | head -30
-file $R/run-sonar 2>&1 | head -2; head -c 1500 $R/run-sonar | cat -v | head -40
-echo "--- run-sonar --help"
-timeout 90 $R/run-sonar --help > /tmp/s1.txt 2>&1; echo "rc=$?"; head -c 3000 /tmp/s1.txt
-echo "--- run-sonar serve --help"
-timeout 90 $R/run-sonar serve --help > /tmp/s2.txt 2>&1; echo "rc=$?"; head -c 3000 /tmp/s2.txt
-echo "== done v1"
+echo "== v2 srbminer variants"
+try "A agent args, plain" "" $BASE --gpu-sensors-disable --api-enable --api-port 21550 --api-rig-name dbg --give-up-limit 3 --retry-time 10 --main-pool-reconnect 120 --max-no-share-sent 900
+try "B agent args, setsid" "setsid" $BASE --gpu-sensors-disable --api-enable --api-port 21550 --api-rig-name dbg --give-up-limit 3 --retry-time 10 --main-pool-reconnect 120 --max-no-share-sent 900
+try "C base + gpu-sensors-disable only" "" $BASE --gpu-sensors-disable
+try "D base + api only" "" $BASE --api-enable --api-port 21550 --api-rig-name dbg
+try "E base + give-up/retry only" "" $BASE --give-up-limit 3 --retry-time 10 --main-pool-reconnect 120 --max-no-share-sent 900
+echo "== v2 done"
