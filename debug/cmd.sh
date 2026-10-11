@@ -1,23 +1,13 @@
 #!/bin/bash
-# v3: which SRBMiner invocation triggers "Unsupported runtime environment"?
+# v4: why does the Dolphin worker sit after "selected GPUs"?
 exec 2>&1
-S=/opt/srb/SRBMiner-MULTI
-W="${PEARL_WALLET}.dbgtest2"
-BASE="--algorithm pearlhash --disable-cpu --disable-gpu-amd --pool prl.kryptex.network:7048 --wallet $W --password x"
-try() { # label, prefix-cmd, args...
-  local l="$1" pre="$2"; shift 2
-  echo "--- $l"
-  $pre $S "$@" > /tmp/v.txt 2>&1 &
-  local p=$!
-  sleep 15
-  if kill -0 $p 2>/dev/null; then echo "ALIVE after 15 s"; else wait $p; echo "EXITED rc=$?"; fi
-  head -c 1200 /tmp/v.txt
-  kill $p 2>/dev/null; sleep 3; kill -9 $p 2>/dev/null; sleep 1
-}
-echo "== v2 srbminer variants"
-try "A agent args, plain" "" $BASE --gpu-sensors-disable --api-enable --api-port 21550 --api-rig-name dbg --give-up-limit 3 --retry-time 10 --main-pool-reconnect 120 --max-no-share-sent 900
-try "B agent args, setsid" "setsid" $BASE --gpu-sensors-disable --api-enable --api-port 21550 --api-rig-name dbg --give-up-limit 3 --retry-time 10 --main-pool-reconnect 120 --max-no-share-sent 900
-try "C base + gpu-sensors-disable only" "" $BASE --gpu-sensors-disable
-try "D base + api only" "" $BASE --api-enable --api-port 21550 --api-rig-name dbg
-try "E base + give-up/retry only" "" $BASE --give-up-limit 3 --retry-time 10 --main-pool-reconnect 120 --max-no-share-sent 900
-echo "== v2 done"
+echo "== v4 $(date -u +%T)"
+ps -eo pid,ppid,etime,stat,pcpu,rss,cmd --sort=start_time | cut -c1-200 | head -30
+echo "--- sockets"; (ss -tnp 2>/dev/null || netstat -tnp 2>/dev/null) | head -20
+W=$(pgrep -f dolphinpod-worker | head -1); echo "worker pid=$W"
+[ -n "$W" ] && { ls -la /proc/$W/fd 2>/dev/null | head -20; cat /proc/$W/status | grep -E "State|Threads|VmRSS"; timeout 8 strace -f -p $W -e trace=network,openat,read,write -o /tmp/w.strace 2>&1 | head -3; tail -25 /tmp/w.strace 2>/dev/null | cut -c1-220; }
+echo "--- dirs"; du -sh /opt/dolphinpod /var/lib/dolphin /tmp 2>/dev/null; ls -la /opt/dolphinpod/runtimes /var/lib/dolphin/cache 2>&1 | head
+echo "--- network to updates.dphn.ai"
+curl -sS -o /dev/null -w "head: %{http_code} %{time_total}s\n" -I https://updates.dphn.ai/runtimes/v2.4.3/text-v.tar.gz 2>&1 | tail -2
+timeout 20 curl -sS -r 0-52428799 -o /dev/null -w "50MB range: %{http_code} %{speed_download} B/s %{time_total}s\n" https://updates.dphn.ai/runtimes/v2.4.3/text-v.tar.gz 2>&1 | tail -2
+echo "== v4 done"
