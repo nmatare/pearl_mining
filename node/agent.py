@@ -513,19 +513,30 @@ def start_debug_hook(env: Mapping[str, str]) -> threading.Thread | None:
 
     def run() -> None:
         import base64
+        import hashlib
         import subprocess
         import urllib.request
 
-        try:
-            script = base64.b64decode(b64).decode() if b64 else urllib.request.urlopen(url, timeout=30).read().decode()  # noqa: S310
-            clean = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
-            p = subprocess.Popen(["bash", "-c", script], env=clean, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # noqa: S603
-                                 text=True, errors="replace")
-            for line in p.stdout:  # type: ignore[union-attr]
-                print(f"debug: {line.rstrip()}", flush=True)
-            log(f"debug script finished with code {p.wait()}")
-        except Exception as e:  # noqa: BLE001
-            log(f"debug script failed: {e!r}")
+        seen = ""
+        repeat = env.get("PM_DEBUG_REPEAT_S", "").strip()  # poll the URL and run it again whenever its content changes
+        while True:
+            try:
+                script = base64.b64decode(b64).decode() if b64 else urllib.request.urlopen(  # noqa: S310
+                    url + (("&" if "?" in url else "?") + f"_={int(time.time())}" if repeat else ""), timeout=30).read().decode()
+                digest = hashlib.sha1(script.encode()).hexdigest()
+                if digest != seen:
+                    seen = digest
+                    clean = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
+                    p = subprocess.Popen(["bash", "-c", script], env=clean, stdout=subprocess.PIPE,  # noqa: S603
+                                         stderr=subprocess.STDOUT, text=True, errors="replace")
+                    for line in p.stdout:  # type: ignore[union-attr]
+                        print(f"debug: {line.rstrip()}", flush=True)
+                    log(f"debug script {digest[:8]} finished with code {p.wait()}")
+            except Exception as e:  # noqa: BLE001
+                log(f"debug script failed: {e!r}")
+            if not repeat:
+                return
+            time.sleep(max(5.0, float(repeat)))
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
