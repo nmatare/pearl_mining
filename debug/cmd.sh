@@ -1,14 +1,14 @@
 #!/bin/bash
-# v4: why does the Dolphin worker sit after "selected GPUs"?
+# v5: is the slow runtime download the disk, the host network, or updates.dphn.ai?
 exec 2>&1
-echo "== v4 $(date -u +%T)"
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl procps iproute2 >/dev/null 2>&1; which curl ss pgrep strace
-ps -eo pid,ppid,etime,stat,pcpu,rss,cmd --sort=start_time | cut -c1-200 | head -30
-echo "--- sockets"; (ss -tnp 2>/dev/null || netstat -tnp 2>/dev/null) | head -20
-W=$(pgrep -f dolphinpod-worker | head -1); echo "worker pid=$W"
-[ -n "$W" ] && { ls -la /proc/$W/fd 2>/dev/null | head -20; cat /proc/$W/status | grep -E "State|Threads|VmRSS"; timeout 8 strace -f -p $W -e trace=network,openat,read,write -o /tmp/w.strace 2>&1 | head -3; tail -25 /tmp/w.strace 2>/dev/null | cut -c1-220; }
-echo "--- dirs"; du -sh /opt/dolphinpod /var/lib/dolphin /tmp 2>/dev/null; ls -la /opt/dolphinpod/runtimes /var/lib/dolphin/cache 2>&1 | head
-echo "--- network to updates.dphn.ai"
-curl -sS -o /dev/null -w "head: %{http_code} %{time_total}s\n" -I https://updates.dphn.ai/runtimes/v2.4.3/text-v.tar.gz 2>&1 | tail -2
-timeout 20 curl -sS -r 0-52428799 -o /dev/null -w "50MB range: %{http_code} %{speed_download} B/s %{time_total}s\n" https://updates.dphn.ai/runtimes/v2.4.3/text-v.tar.gz 2>&1 | tail -2
-echo "== v4 done"
+echo "== v5 $(date -u +%T)"
+U=https://updates.dphn.ai/runtimes/v2.4.3/text-v.tar.gz
+echo "--- disk write speed"; dd if=/dev/zero of=/opt/ddtest bs=1M count=1500 oflag=direct 2>&1 | tail -1; rm -f /opt/ddtest
+echo "--- cloudflare speed test (100 MB)"; timeout 40 curl -sS -o /dev/null -w "%{http_code} %{speed_download} B/s %{time_total}s\n" "https://speed.cloudflare.com/__down?bytes=100000000" 2>&1 | tail -1
+echo "--- updates.dphn.ai ranges (60 MB each, 25 s max)"
+for off in 0 2000000000 4000000000; do
+  timeout 25 curl -sS -r $off-$((off+59999999)) -o /dev/null -w "off=$off %{http_code} %{speed_download} B/s %{size_download} bytes %{time_total}s\n" $U 2>&1 | tail -1
+done
+curl -sI $U | grep -i -E "cf-cache-status|cf-ray|age|server|content-length" 
+echo "--- worker progress"; du -sh /opt/dolphinpod; ls -la /opt/dolphinpod/runtimes/.text-v-*/text-v 2>/dev/null | head -5
+echo "== v5 done"
