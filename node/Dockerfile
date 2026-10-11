@@ -14,6 +14,8 @@ ADD --checksum=sha256:${SRB_SHA} \
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 ca-certificates tini \
+    # SRBMiner JIT-compiles its pearlhash kernels: without NVRTC it connects to the pool but never hashes (Vast A100 smoke)
+    cuda-nvrtc-12-8 cuda-cudart-12-8 \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /opt/srb /opt/dolphin \
  && tar -xzf /tmp/srb.tgz -C /opt/srb --strip-components=1 \
