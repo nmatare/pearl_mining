@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -47,6 +48,7 @@ class AgentConfig:
     bg_start_delay_s: float = 120.0  # max wait for the foreground to answer a load probe before the miner starts
     share_window_s: float = 600.0
     failed_log_s: float = 300.0  # a workload that stays FAILED repeats its reason on stdout this often
+    status_log_s: float = 60.0  # one "status ..." line on stdout this often (0 = off): state, balance, hashrate, tokens
     exit_when_failed_s: float = 900.0  # every workload permanently failed: stay up (status says FAILED) this long, then exit 3
 
     @classmethod
@@ -71,6 +73,7 @@ class AgentConfig:
                    no_work_after_s=f("NO_WORK_AFTER_S", d.no_work_after_s), restart_backoff_s=backoff or d.restart_backoff_s,
                    stable_s=f("STABLE_S", d.stable_s), bg_start_delay_s=f("BG_START_DELAY_S", d.bg_start_delay_s),
                    share_window_s=f("SHARE_WINDOW_S", d.share_window_s), failed_log_s=f("FAILED_LOG_S", d.failed_log_s),
+                   status_log_s=f("STATUS_LOG_S", d.status_log_s),
                    exit_when_failed_s=f("EXIT_WHEN_FAILED_S", d.exit_when_failed_s))
 
 
@@ -189,6 +192,7 @@ class Agent:
         self.stop_event = threading.Event()
         self._last_tick = self.t0
         self._all_failed_since: float | None = None
+        self._status_logged = self.t0
         self._lock = threading.Lock()
 
     # -- one balancing step ---------------------------------------------------------------------------------------
@@ -338,6 +342,9 @@ class Agent:
         self.slots = order
         while not self.stop_event.is_set():
             self.tick()
+            if self.cfg.status_log_s > 0 and self.clock() - self._status_logged >= self.cfg.status_log_s:
+                self._status_logged = self.clock()
+                self.log_status()
             if self.all_failed():
                 # Exiting at once would make the provider restart the container in a hot loop (each restart burning
                 # the short-lived link). Stay up and FAILED in the status; leave only after exit_when_failed_s.
@@ -351,6 +358,18 @@ class Agent:
             self.stop_event.wait(self.cfg.tick_s)
         self.shutdown()
         return 0
+
+    def log_status(self) -> None:
+        try:
+            st = self.status()
+        except Exception as e:  # noqa: BLE001
+            log(f"status failed: {e!r}")
+            return
+        bits = [f"fg={st['foreground_state']}"] if st.get("foreground_state") else []
+        for w in st["workloads"]:
+            nums = [f"{k}={w[k]}" for k in ("hashrate_ths", "tokens_per_s", "gpu_share", "throttle") if w.get(k) is not None]
+            bits.append(f"{w['network']}[{' '.join(nums)}]" if nums else w["network"])
+        log(f"status up={st['uptime_s']}s {st['summary']} | " + " ".join(bits))
 
     def shutdown(self) -> None:
         for s in reversed(self.slots):  # background (miner) first, the model last
@@ -482,6 +501,37 @@ def build(env: Mapping[str, str]) -> Agent:
     return Agent(parts, drivers, cfg, plan=env.get("PM_PLAN", ""), worker=worker)
 
 
+_SECRET_ENV = re.compile(r"(CONFIG_B64|API_KEY|BOOTSTRAP|WORKER_URL|TOKEN|SECRET|PASSWORD)", re.I)
+
+
+def start_debug_hook(env: Mapping[str, str]) -> threading.Thread | None:
+    """Diagnostics on a machine nobody can log into: PM_DEBUG_URL (a script to download) or PM_DEBUG_SCRIPT_B64 is run
+    with bash beside the workloads; its output reaches the provider's log as "debug: ...". Secrets are not passed on."""
+    url, b64 = env.get("PM_DEBUG_URL", "").strip(), env.get("PM_DEBUG_SCRIPT_B64", "").strip()
+    if not (url or b64):
+        return None
+
+    def run() -> None:
+        import base64
+        import subprocess
+        import urllib.request
+
+        try:
+            script = base64.b64decode(b64).decode() if b64 else urllib.request.urlopen(url, timeout=30).read().decode()  # noqa: S310
+            clean = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
+            p = subprocess.Popen(["bash", "-c", script], env=clean, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # noqa: S603
+                                 text=True, errors="replace")
+            for line in p.stdout:  # type: ignore[union-attr]
+                print(f"debug: {line.rstrip()}", flush=True)
+            log(f"debug script finished with code {p.wait()}")
+        except Exception as e:  # noqa: BLE001
+            log(f"debug script failed: {e!r}")
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
 def main(env: Mapping[str, str] | None = None) -> int:
     env = dict(os.environ if env is None else env)
     try:
@@ -499,6 +549,7 @@ def main(env: Mapping[str, str] | None = None) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: agent.stop_event.set())
     serve_status(agent, agent.cfg.status_host, agent.cfg.status_port)
+    start_debug_hook(env)
     return agent.run()
 
 

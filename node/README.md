@@ -93,7 +93,7 @@ utilisation itself. `useful` and `background` modes are refused.
 ## Building and pushing
 ```
 node/build.sh            # local linux/amd64 build: ghcr.io/nmatare/pearl-node:<VERSION>-ampere-ada and -blackwell, nothing pushed
-DRY_RUN=1 docker run --rm -e PM_PARTS=pearl:dedicated -e PEARL_WALLET=prl1p... -e WORKER=test ghcr.io/nmatare/pearl-node:0.1.1-ampere-ada
+DRY_RUN=1 docker run --rm -e PM_PARTS=pearl:dedicated -e PEARL_WALLET=prl1p... -e WORKER=test ghcr.io/nmatare/pearl-node:0.1.2-ampere-ada
 ```
 Pushing (not done by any script): `echo $GHCR_TOKEN | docker login ghcr.io -u <user> --password-stdin` with a classic PAT scoped `write:packages`, then
 `docker push ghcr.io/nmatare/pearl-node:<VERSION>-ampere-ada` (and `-blackwell`).
