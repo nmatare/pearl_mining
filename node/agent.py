@@ -280,9 +280,11 @@ class Agent:
         bg_start_delay_s, and starts at once if the foreground can never run."""
         if s is not self.bg or self.fg is None or self.fg.permanent or (self.fg.fails and not self.fg.started):
             return True
-        if now - self.t0 >= self.cfg.bg_start_delay_s:
+        delay = getattr(self.fg.driver, "bg_start_delay_s", None)
+        if now - self.t0 >= (self.cfg.bg_start_delay_s if delay is None else delay):
             return True
-        return self.fg.started and self._call(self.fg, "load") is not None
+        # the model is on the GPU once the foreground answers a load probe or reports running (connected)
+        return self.fg.started and (self._call(self.fg, "load") is not None or self.fg.state == "running")
 
     def _supervise(self, s: Slot, now: float) -> None:
         if s.permanent:
