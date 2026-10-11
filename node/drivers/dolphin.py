@@ -134,7 +134,59 @@ def parse_worker_config(b64: str) -> dict:
 
 
 _SECRETISH = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CONFIG_B64|WALLET|BOOTSTRAP)", re.I)
-_BACKEND_NAMES = ("aphrodite", "sonar")  # the engine in the runtime bundle (v2.4.3: `bin/aphrodite serve <model> --uds ...`)
+_BACKEND_NAMES = ("aphrodite", "aphrodite.real", "sonar")  # the engine in the runtime bundle (v2.4.3: `bin/aphrodite serve <model> --uds ...`)
+
+
+# ---- EXPERIMENT (OFF by default): bf16 KV cache so an SM80 card (A100) can start the engine ---------------------------
+# DOLPHIN_EXPERIMENT_BF16_KV=1 replaces <runtime>/bin/aphrodite with a visible sh wrapper that changes ONE thing: the value of
+# --kv-cache-dtype (fp8* -> bfloat16). Nothing else: no environment, output or logprob tampering. The runtime tree then differs
+# from the published bundle, so the worker's own integrity attestation reports a DIFFERENT hash to Dolphin. That is intended
+# (we want Dolphin to see it); it is neither masked nor spoofed. The original binary is kept as aphrodite.real.
+BF16_KV_ENV = "DOLPHIN_EXPERIMENT_BF16_KV"
+BF16_KV_MARK = "# pearl-node EXPERIMENT: bf16 KV cache wrapper"
+DEFAULT_ENGINE_BIN = "/opt/dolphinpod/runtimes/text-v/bin/aphrodite"
+
+
+def bf16_kv_wrapper_script(real: str) -> str:
+    return f"""#!/bin/sh
+{BF16_KV_MARK} (DOLPHIN_EXPERIMENT_BF16_KV=1). Only --kv-cache-dtype fp8* is rewritten to bfloat16.
+echo "pearl-node EXPERIMENT: engine started with --kv-cache-dtype rewritten fp8 -> bfloat16 (modified runtime, not the published bundle)" >&2
+n=$#
+while [ "$n" -gt 0 ]; do
+  a="$1"; shift; n=$((n - 1))
+  case "$a" in
+    --kv-cache-dtype=fp8*) a="--kv-cache-dtype=bfloat16" ;;
+    --kv-cache-dtype)
+      v=""
+      if [ "$n" -gt 0 ]; then v="$1"; shift; n=$((n - 1)); fi
+      case "$v" in fp8*) v=bfloat16 ;; esac
+      set -- "$@" "$a" "$v"
+      continue ;;
+  esac
+  set -- "$@" "$a"
+done
+exec "{real}" "$@"
+"""
+
+
+def install_bf16_kv_wrapper(engine_bin: str = DEFAULT_ENGINE_BIN) -> str:
+    """Idempotent. Returns 'installed', 'already' or 'missing'."""
+    if not os.path.exists(engine_bin):
+        return "missing"
+    try:
+        with open(engine_bin, "rb") as f:
+            if BF16_KV_MARK.encode() in f.read(400):
+                return "already"
+    except OSError:
+        return "missing"
+    real = engine_bin + ".real"
+    os.replace(engine_bin, real)
+    tmp = engine_bin + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(bf16_kv_wrapper_script(real))
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, engine_bin)
+    return "installed"
 
 
 def find_backend(proc_root: str = "/proc") -> tuple[list[str], dict[str, str]] | None:
@@ -497,6 +549,10 @@ class Driver(ProcessDriver):
                 self.phase = "run" if direct else "install"
                 self._backend = None
                 self.backend_error = ""
+                if self.kind == "config" and (self.env.get(BF16_KV_ENV) or "").strip() in ("1", "true", "yes"):
+                    print(f"dolphin: !!! EXPERIMENT {BF16_KV_ENV}=1 ACTIVE: the engine's --kv-cache-dtype will be rewritten fp8 -> bfloat16; "
+                          "the runtime will differ from the published bundle and Dolphin will see a different hash !!!", flush=True)
+                    threading.Thread(target=self._bf16_kv_watch, args=(cancel,), daemon=True).start()
                 self._spawn(self.command())
             if self.kind == "config":
                 threading.Thread(target=self._tap_backend, args=(self.proc, cancel), daemon=True).start()
@@ -622,6 +678,20 @@ class Driver(ProcessDriver):
             os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
         except OSError as e:
             raise DriverError(f"download failed: cannot save the worker: {e.strerror or e}") from e
+
+    def _bf16_kv_watch(self, cancel: threading.Event) -> None:
+        """Thread (experiment): wait for the worker to unpack its runtime, then put the visible wrapper in place."""
+        engine = self.env.get("DOLPHIN_ENGINE_BIN") or DEFAULT_ENGINE_BIN
+        while not cancel.is_set():
+            try:
+                r = install_bf16_kv_wrapper(engine)
+            except OSError as e:
+                print(f"dolphin: EXPERIMENT bf16 KV wrapper failed: {e}", flush=True)
+                return
+            if r != "missing":
+                print(f"dolphin: EXPERIMENT bf16 KV wrapper {r} at {engine} (original kept as {engine}.real)", flush=True)
+                return
+            cancel.wait(0.05)
 
     def _tap_backend(self, proc, cancel: threading.Event) -> None:
         """Thread: while the worker runs, remember how it started its engine."""
