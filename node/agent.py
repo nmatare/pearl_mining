@@ -45,7 +45,7 @@ class AgentConfig:
     no_work_after_s: float = 120.0
     restart_backoff_s: tuple[float, ...] = (5.0, 15.0, 60.0, 300.0)
     stable_s: float = 600.0  # a workload that ran this long resets its failure count
-    bg_start_delay_s: float = 120.0  # max wait for the foreground to answer a load probe before the miner starts
+    bg_start_delay_s: float = 0.0  # the miner starts at boot (0): it never waits for the foreground; a driver may ask for a wait
     share_window_s: float = 600.0
     failed_log_s: float = 300.0  # a workload that stays FAILED repeats its reason on stdout this often
     status_log_s: float = 60.0  # one "status ..." line on stdout this often (0 = off): state, balance, hashrate, tokens
@@ -207,8 +207,10 @@ class Agent:
         load = None
         if self.fg is not None:
             load = self._call(self.fg, "load")
+            # The foreground only takes GPU share once it is really serving: while it downloads, installs, starts or has
+            # failed (up but never verified) the miner keeps the whole GPU.
             fg_alive = (self.fg.started and self.fg.driver.alive() and not self.fg.permanent
-                        and self.fg.state != "failed")  # up but never verified counts as down: the miner keeps the GPU
+                        and self.fg.state == "running")
             self.verdict = self.balancer.decide(load, fg_alive, now)
             if self.bg is not None and self.bg.started and not self.bg.permanent:
                 self._apply_throttle(self.bg, self.verdict.level)
@@ -280,8 +282,8 @@ class Agent:
             return None
 
     def _may_start(self, s: Slot, now: float) -> bool:
-        """The background waits for the foreground to answer a load probe (VRAM goes to the model first), at most
-        bg_start_delay_s, and starts at once if the foreground can never run."""
+        """The background (miner) starts at boot: bg_start_delay_s defaults to 0, so it never waits for the foreground.
+        A driver (or PM_AGENT_BG_START_DELAY_S) may still ask for a wait for the model to reach the GPU first."""
         if s is not self.bg or self.fg is None or self.fg.permanent or (self.fg.fails and not self.fg.started):
             return True
         delay = getattr(self.fg.driver, "bg_start_delay_s", None)

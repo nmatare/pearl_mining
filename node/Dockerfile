@@ -22,7 +22,7 @@ RUN apt-get update \
  && ln -s /opt/srb/SRBMiner-MULTI /usr/local/bin/SRBMiner-MULTI \
  && rm /tmp/srb.tgz
 
-COPY agent.py workername.py /opt/node/
+COPY agent.py workername.py prefetch.py /opt/node/
 COPY drivers/ /opt/node/drivers/
 
 ENV NVIDIA_VISIBLE_DEVICES=all \

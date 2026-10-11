@@ -7,6 +7,7 @@ Throttling is SIGSTOP/SIGCONT (intensity flags are unconfirmed for pearlhash); s
 from __future__ import annotations
 
 import json
+import os
 
 from . import ConfigError, ProcessDriver, http_get, split_args
 
@@ -74,12 +75,16 @@ class Driver(ProcessDriver):
         self.worker = env.get("PM_WORKER", "")
         self.pool = env.get("PEARL_POOL", DEFAULT_POOL)
         self.algo = env.get("PEARL_ALGO", "pearlhash")
-        self.bin = env.get("PEARL_MINER_BIN", "SRBMiner-MULTI")
+        # absolute path: launched via the /usr/local/bin symlink SRBMiner aborts with "Unsupported runtime environment" (F02/L04)
+        self.bin = env.get("PEARL_MINER_BIN", "/opt/srb/SRBMiner-MULTI")
         self.api_port = int(env.get("PEARL_API_PORT", "21550"))
+
+    def cwd(self) -> str | None:
+        return os.path.dirname(self.bin) or None  # run from the miner's own dir, as SRBMiner expects
 
     def command(self) -> list[str]:
         login = f"{self.wallet}.{self.worker}" if self.worker else self.wallet
-        cmd = [self.bin, "--algorithm", self.algo, "--disable-cpu", "--disable-gpu-amd", "--gpu-sensors-disable",
+        cmd = [self.bin, "--algorithm", self.algo, "--disable-cpu", "--disable-gpu-amd",
                "--pool", self.pool, "--wallet", login, "--password", "x",
                "--api-enable", "--api-port", str(self.api_port)]
         if self.worker:

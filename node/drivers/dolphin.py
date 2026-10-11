@@ -5,9 +5,11 @@
                        $XDG_CONFIG_HOME/dolphinpod/worker.json (mode 0600, worker_id dropped so each machine registers as its
                        own), writes a fresh random /etc/machine-id when it can, downloads the public worker binary
                        (DOLPHIN_WORKER_BINARY_URL, default updates.dphn.ai, checked against checksums.txt) and runs
-                       `dolphinpod-worker foreground`. No link, no expiry. The worker itself then fetches its 5.5 GB runtime
-                       bundle into /opt/dolphinpod and the model into the HF cache (tens of GB, so the first start takes
-                       a long while: health says "starting" with the worker's last output line meanwhile).
+                       `dolphinpod-worker foreground`. No link, no expiry. Before the worker starts, node/prefetch.py
+                       downloads its 5.5 GB runtime bundle and the model (Hugging Face cache layout) in PARALLEL over many
+                       ranged connections into the places the worker reads, so the worker skips its own single-stream
+                       downloads (minutes instead of tens of minutes; best effort, see DOLPHIN_PREFETCH below). The agent
+                       starts the Pearl miner at once and gives it the whole GPU until this worker is really serving.
   DOLPHIN_BOOTSTRAP    the dashboard's worker bootstrap link: its `curlCommand` (preferred), or its bootstrap/download URL
   DOLPHIN_WORKER_URL   the same, for a link that is a direct binary URL (`downloadUrl`) or a bootstrap script URL
   none of them         start() raises Unsupported: the agent reports "dolphin FAILED: no worker configured", never "idle"
@@ -32,6 +34,9 @@ No requests right now is NOT a failure: that is a connected worker with load 0 (
 Env: DOLPHIN_HOME (config mode: HOME for the worker, default /var/lib/dolphin; config in <home>/config, caches in <home>/cache),
 DOLPHIN_WORKER_BINARY_URL, DOLPHIN_CHECKSUMS_URL, DOLPHIN_FRESH_MACHINE_ID (default 1), DOLPHIN_SONAR_SOCKET (glob of
 the worker's local engine socket, default /tmp/dp-*/v.sock: load is read from its /metrics),
+DOLPHIN_PREFETCH (default 1; 0 = let the worker download), DOLPHIN_MODEL (explicit model id; else the config's `model`,
+and for "auto" DOLPHIN_AUTO_MODEL, default unsloth/Qwen3.8-27B-NVFP4), DOLPHIN_MODEL_REVISION (main), DOLPHIN_RUNTIME_URL
+(the runtime bundle), DOLPHIN_PREFETCH_WAIT_S (600: how long the worker start waits for the prefetch), HF_ENDPOINT, HF_TOKEN,
 DOLPHIN_WALLET (required), DOLPHIN_API_KEY (passed to the worker, never printed), DOLPHIN_MODE, DOLPHIN_METRICS_URL
 (Prometheus text, default Sonar's port 2242, applicability to the worker UNCONFIRMED), DOLPHIN_SLOTS (concurrency slots).
 Load = busy fraction from request counters; unknown (None) when the metrics endpoint is unreachable. Foreground only
@@ -54,6 +59,8 @@ import threading
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
+
+import prefetch as pf
 
 from . import ConfigError, DriverError, ProcessDriver, Unsupported, http_get, split_args
 
@@ -234,16 +241,18 @@ class Driver(ProcessDriver):
         self._diag_at = 0.0
         self._diag_every_s = float(env.get("DOLPHIN_DIAG_EVERY_S") or "60")
         self._metrics_seen: str | None = None  # last reported state of the engine's metrics, to log changes only
-        # A background miner waits for the model to be on the GPU (VRAM goes to the model first). The config mode
-        # downloads ~25 GB first, so it waits for the worker to report running rather than the agent's 2 min default.
-        self.bg_start_delay_s: float | None = None
+        # The miner is never gated on this worker: it starts at boot and has the whole GPU until the worker serves
+        # (agent.py). DOLPHIN_BG_WAIT_S restores a wait for the worker (seconds) for GPUs too small to hold both.
+        self.bg_start_delay_s: float | None = float(env["DOLPHIN_BG_WAIT_S"]) if env.get("DOLPHIN_BG_WAIT_S") else None
+        self.prefetch_on = (env.get("DOLPHIN_PREFETCH") or "1").strip().lower() not in ("0", "false", "no", "off")
+        self.prefetch_wait_s = float(env.get("DOLPHIN_PREFETCH_WAIT_S") or "600")
+        self.prefetcher: pf.Prefetcher | None = None
         if self.cmd:
             self.kind = "cmd"
         elif self.config_b64:
             try:
                 self.config = parse_worker_config(self.config_b64)
                 self.kind = "config"
-                self.bg_start_delay_s = float(env.get("DOLPHIN_BG_WAIT_S") or "3600")
                 if "DOLPHIN_CONNECT_TIMEOUT_S" not in env:  # runtime bundle + model download: far longer than a link install
                     self.connect_timeout_s = 3600.0
             except ValueError as e:
@@ -311,7 +320,26 @@ class Driver(ProcessDriver):
             e["HOME"] = self.home
             e["XDG_CONFIG_HOME"] = self.config_home
             e["XDG_CACHE_HOME"] = self.cache_home
+            e.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")  # harmless if the engine's Python has hf_transfer
         return e
+
+    def model_id(self) -> str:
+        """The model the worker will download: explicit DOLPHIN_MODEL, else the config's model, and for "auto" the id the
+        worker resolves it to (research/dolphin_worker_binary.md 3.3; DOLPHIN_AUTO_MODEL if that changes)."""
+        m = (self.env.get("DOLPHIN_MODEL") or "").strip() or str(self.config.get("model") or "auto").strip()
+        return (self.env.get("DOLPHIN_AUTO_MODEL") or pf.DEFAULT_AUTO_MODEL).strip() if m.lower() == "auto" else m
+
+    def prefetch_config(self) -> pf.PrefetchConfig:
+        e = self.env
+        return pf.PrefetchConfig(
+            worker_dir=os.path.dirname(self.dest) or ".", cache_home=self.cache_home, home=self.home,
+            runtime_url=(e.get("DOLPHIN_RUNTIME_URL") or pf.DEFAULT_RUNTIME_URL).strip(), model=self.model_id(),
+            revision=(e.get("DOLPHIN_MODEL_REVISION") or "main").strip(),
+            hf_endpoint=(e.get("HF_ENDPOINT") or "https://huggingface.co").strip(),
+            hf_token=(e.get("HF_TOKEN") or e.get("HUGGING_FACE_HUB_TOKEN") or "").strip(),
+            runtime_workers=int(e.get("DOLPHIN_PREFETCH_RUNTIME_CONNS") or "8"),
+            model_workers=int(e.get("DOLPHIN_PREFETCH_MODEL_CONNS") or "12"),
+            runtime_marker=e.get("DOLPHIN_RUNTIME_MARKER") or pf.RUNTIME_MARKER)
 
     @property
     def config_home(self) -> str:
@@ -329,7 +357,7 @@ class Driver(ProcessDriver):
         return self.workdir if self.kind in ("script", "curl") else None
 
     def secrets(self) -> list[str]:
-        vals = [self.env.get("DOLPHIN_API_KEY", ""), self.config_b64]
+        vals = [self.env.get("DOLPHIN_API_KEY", ""), self.config_b64, self.env.get("HF_TOKEN", "")]
         if self.config.get("api_key"):
             vals.append(str(self.config["api_key"]))
         for url in re.findall(r"https?://[^\s'\"]+", self.source):  # the whole link, then the tokens inside it
@@ -382,6 +410,7 @@ class Driver(ProcessDriver):
             self._ensure_dir()
             if self.kind == "config":
                 self._setup_config()
+                self._start_prefetch()  # runtime + model downloads run beside the worker-binary fetch
             direct = self.kind in ("binary", "config")
             path = self.dest if direct else os.path.join(self.workdir, "bootstrap.sh")
             try:
@@ -395,11 +424,13 @@ class Driver(ProcessDriver):
                     print(f"dolphin: {self.note}", flush=True)
                 else:
                     raise
+            self._await_prefetch(cancel)
             with self._lock:
                 if cancel.is_set():
                     return
                 self.phase = "run" if direct else "install"
                 self._spawn(self.command())
+            self._watch_cache(cancel)
         except (DriverError, Unsupported) as e:
             if cancel.is_set():  # superseded by a newer start(): its state is not ours to overwrite
                 return
@@ -408,6 +439,41 @@ class Driver(ProcessDriver):
         except Exception as e:  # noqa: BLE001 - never leave the slot in limbo
             if not cancel.is_set():
                 self.failure = self.redact(f"install crashed: {type(e).__name__}: {e}")
+
+    def _start_prefetch(self) -> None:
+        if not self.prefetch_on or self.prefetcher is not None and not self.prefetcher.finished():
+            return
+        try:
+            self.prefetcher = pf.Prefetcher(self.prefetch_config())
+            self.prefetcher.start()
+            print(f"dolphin: prefetching the runtime bundle and {self.prefetcher.cfg.model} in parallel", flush=True)
+        except Exception as e:  # noqa: BLE001 - a prefetch bug must never stop the worker from starting
+            self.prefetcher = None
+            print(f"dolphin: prefetch not started ({type(e).__name__}: {e}); the worker downloads for itself", flush=True)
+
+    def _await_prefetch(self, cancel: threading.Event) -> None:
+        """The worker would download the same files again if it started now: wait (bounded) until they are in place."""
+        p = self.prefetcher
+        if p is None:
+            return
+        ok = p.wait(self.prefetch_wait_s, until=cancel.is_set)
+        if not ok and not cancel.is_set():
+            p.cancel()
+            print(f"dolphin: prefetch not complete ({p.summary()}); starting the worker anyway", flush=True)
+
+    def _watch_cache(self, cancel: threading.Event) -> None:
+        """Right after the worker starts: if it creates its model cache somewhere we did not link, say where (and adopt it)."""
+        p = self.prefetcher
+        if p is None or p.model.state not in ("done", "skipped"):
+            return
+        for _ in range(12):
+            if cancel.wait(5):
+                return
+            try:
+                if pf.adopt_foreign_cache(p.cfg):
+                    return
+            except Exception:  # noqa: BLE001
+                return
 
     def _setup_config(self) -> None:
         """worker.json (0600, no worker_id), a fresh /etc/machine-id, and the dirs the worker writes to."""
@@ -511,6 +577,8 @@ class Driver(ProcessDriver):
 
     def stop(self) -> None:
         self._cancel.set()
+        if self.prefetcher is not None:
+            self.prefetcher.cancel()
         t = self._thread
         if t is not None and t.is_alive():
             t.join(5)
@@ -547,11 +615,13 @@ class Driver(ProcessDriver):
         """{'state': installing|starting|running|failed, 'reason': str, 'evidence': [str]}. Never says running without evidence."""
         if self._installing():
             waited = self.clock() - (self.started_at or self.clock())
-            if waited > self.fetch_total_s + 30:  # the fetch loop checks its own deadline; this catches a hung read
+            limit = self.fetch_total_s + 30 + (self.prefetch_wait_s if self.prefetcher is not None else 0)
+            if waited > limit:  # the fetch loop checks its own deadline; this catches a hung read
                 self._cancel.set()
                 return {"state": "failed", "evidence": [],
                         "reason": f"download too slow: not finished after {waited / 60:.0f} min"}
-            return {"state": "installing", "reason": "downloading the worker", "evidence": []}
+            what = f"downloading {self.prefetcher.summary()}" if self.prefetcher is not None else "downloading the worker"
+            return {"state": "installing", "reason": what, "evidence": []}
         if self.failure:
             return {"state": "failed", "reason": self.failure, "evidence": []}
         if self.proc is None and not self.parked:
