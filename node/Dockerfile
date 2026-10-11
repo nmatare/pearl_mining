@@ -2,7 +2,11 @@
 # Generic node image: node/agent.py runs the plan's workloads (Pearl miner now; Dolphin worker is supplied at runtime).
 # CUDA base only provides env/ld paths; the NVIDIA driver (libcuda) is injected by the host. Never overwrite LD_LIBRARY_PATH.
 # One build, tagged per arch (ampere-ada, blackwell) so groups can diverge later (research/miner.md section 6).
-FROM nvidia/cuda:12.8.1-base-ubuntu22.04
+# CUDA base per arch: Salad only schedules on hosts whose driver satisfies the image's NVIDIA_REQUIRE_CUDA, so Ampere/Ada
+# uses 12.2 (most gaming-PC drivers) and only Blackwell needs 12.8. CI passes CUDA_TAG and CUDA_PKG per variant.
+ARG CUDA_TAG=12.2.2
+FROM nvidia/cuda:${CUDA_TAG}-base-ubuntu22.04
+ARG CUDA_PKG=12-2
 
 ARG SRB_VER=3.7.5
 ARG SRB_SHA=f18e33dac31d4fd5c6909409d7a82793477e8b93c63b897c7a19befff0c33ca8
@@ -15,7 +19,7 @@ ADD --checksum=sha256:${SRB_SHA} \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 ca-certificates tini \
     # SRBMiner JIT-compiles its pearlhash kernels: without NVRTC it connects to the pool but never hashes (Vast A100 smoke)
-    cuda-nvrtc-12-8 cuda-cudart-12-8 \
+    cuda-nvrtc-${CUDA_PKG} cuda-cudart-${CUDA_PKG} \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /opt/srb /opt/dolphin \
  && tar -xzf /tmp/srb.tgz -C /opt/srb --strip-components=1 \
