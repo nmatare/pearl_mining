@@ -165,7 +165,7 @@ def download_ranged(url: str, dest: str, size: int, *, headers: dict | None = No
             except (OSError, HTTPException) as e:
                 raise PrefetchError(f"download failed: {e}") from e
             if off != size:
-                raise PrefetchError(f"expected {size} bytes, got {off}")
+                raise PrefetchError(f"expected {size} bytes, got {off}") from None
     finally:
         os.close(fd)
 
