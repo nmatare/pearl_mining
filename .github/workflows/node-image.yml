@@ -1,0 +1,16 @@
+name: node-image
+on: {workflow_dispatch: {}}
+permissions: {contents: read, packages: write}
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+      - run: |
+          V=$(cat node/VERSION)
+          for arch in ampere-ada blackwell; do
+            docker buildx build --platform linux/amd64 --build-arg PM_ARCH=$arch -t ghcr.io/nmatare/pearl-node:$V-$arch -f node/Dockerfile --push node
+          done
