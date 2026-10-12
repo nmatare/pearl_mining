@@ -1,7 +1,8 @@
 """Pearl driver: dedicated SRBMiner (pearlhash) through a pool, or a reporting-only stub for the vLLM plugin mode.
 
 Env: PEARL_WALLET (required for dedicated/background), PEARL_POOL, PEARL_ALGO, PEARL_MODE, PM_WORKER (set by the agent),
-PEARL_MINER_BIN, PEARL_API_PORT, PEARL_EXTRA_ARGS. Flags per research/miner.md (3.7.5): no overclocking, no --pearl-k*.
+PEARL_MINER_BIN, PEARL_API_PORT, PEARL_EXTRA_ARGS, PEARL_GPU_VENDOR (nvidia|amd; default amd when PM_NODE_ARCH=amd,
+else nvidia), PEARL_MINER (srbminer|krig; default srbminer; krig is the Kryptex ROCm miner shipped in the -amd image). Flags per research/miner.md (3.7.5): no overclocking, no --pearl-k*.
 Throttling is SIGSTOP/SIGCONT (intensity flags are unconfirmed for pearlhash); see ProcessDriver.
 """
 from __future__ import annotations
@@ -12,6 +13,8 @@ import os
 from . import ConfigError, ProcessDriver, http_get, split_args
 
 DEFAULT_POOL = "prl.kryptex.network:7048"
+KRIG_POOL = "prl.kryptex.network:8048"  # the TLS port from the Krig README
+KRIG_BIN = "/opt/krig/krig-miner"
 
 
 def parse_miner_stats(doc: object) -> dict:
@@ -76,15 +79,31 @@ class Driver(ProcessDriver):
         self.pool = env.get("PEARL_POOL", DEFAULT_POOL)
         self.algo = env.get("PEARL_ALGO", "pearlhash")
         # absolute path: launched via the /usr/local/bin symlink SRBMiner aborts with "Unsupported runtime environment" (F02/L04)
-        self.bin = env.get("PEARL_MINER_BIN", "/opt/srb/SRBMiner-MULTI")
+        self.vendor = (env.get("PEARL_GPU_VENDOR") or ("amd" if env.get("PM_NODE_ARCH") == "amd" else "nvidia")).lower()
+        if self.vendor not in ("nvidia", "amd"):
+            raise ConfigError(f"pearl: PEARL_GPU_VENDOR must be nvidia or amd, got {self.vendor!r}")
+        self.miner = (env.get("PEARL_MINER") or "srbminer").lower()
+        if self.miner not in ("srbminer", "krig"):
+            raise ConfigError(f"pearl: PEARL_MINER must be srbminer or krig, got {self.miner!r}")
+        if self.miner == "krig":
+            self.pool = env.get("PEARL_POOL", KRIG_POOL)
+        self.bin = env.get("PEARL_MINER_BIN", KRIG_BIN if self.miner == "krig" else "/opt/srb/SRBMiner-MULTI")
         self.api_port = int(env.get("PEARL_API_PORT", "21550"))
 
     def cwd(self) -> str | None:
         return os.path.dirname(self.bin) or None  # run from the miner's own dir, as SRBMiner expects
 
     def command(self) -> list[str]:
+        if self.miner == "krig":
+            cmd = [self.bin, "--no-tui", "-u", f"{self.wallet}/{self.worker}" if self.worker else self.wallet,
+                   "-o", self.pool, "--api-port", str(self.api_port)]
+            if self.vendor == "amd":
+                cmd.append("--no-cuda")
+            return cmd + split_args(self.env.get("PEARL_EXTRA_ARGS", ""))
+        # SRBMiner: switch off the other vendor's backend (the NVIDIA-only flag set would be wrong on AMD and vice versa)
+        other = "--disable-gpu-nvidia" if self.vendor == "amd" else "--disable-gpu-amd"
         login = f"{self.wallet}.{self.worker}" if self.worker else self.wallet
-        cmd = [self.bin, "--algorithm", self.algo, "--disable-cpu", "--disable-gpu-amd",
+        cmd = [self.bin, "--algorithm", self.algo, "--disable-cpu", other,
                "--pool", self.pool, "--wallet", login, "--password", "x",
                "--api-enable", "--api-port", str(self.api_port)]
         if self.worker:
@@ -117,6 +136,8 @@ class Driver(ProcessDriver):
     def stats(self) -> dict:
         if self.mode == "useful" or self.proc is None:
             return {}
+        if self.miner == "krig":
+            return {}  # Krig's API layout is unmeasured; the pool side still sees the worker
         try:
             return parse_miner_stats(json.loads(http_get(f"http://127.0.0.1:{self.api_port}/")))
         except (OSError, ValueError):

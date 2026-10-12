@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.6
+# AMD node image: same agent/env contract as node/Dockerfile (PEARL_* / PM_* vars) on a ROCm 7.1+ user space.
+# Hosts: Vast (bare metal: pass /dev/kfd /dev/dri, group video+render) and Salad AMD nodes (WSL2, GPU at /dev/dxg; the host
+# injects librocdxg, libdxcore, amd-smi; ROCm user space must come from this image and must be >= 7.1 or HSA fails with
+# OUT_OF_RESOURCES). Never assign LD_LIBRARY_PATH/PATH here; never unset HSA_ENABLE_DXG_DETECTION.
+# Miners: SRBMiner-MULTI 3.7.5 (default; AMD RDNA pearlhash since 3.6.0, backend undocumented/unmeasured) and Kryptex Krig 1.5.6
+# (ROCm/HIP, documented AMD path; select with PEARL_MINER=krig). Dolphin is NVIDIA-only and is not in this image.
+ARG ROCM_TAG=7.1
+FROM rocm/dev-ubuntu-24.04:${ROCM_TAG}-complete
+
+ARG SRB_VER=3.7.5
+ARG SRB_SHA=f18e33dac31d4fd5c6909409d7a82793477e8b93c63b897c7a19befff0c33ca8
+ARG KRIG_VER=1.5.6
+ARG KRIG_SHA=311b8b6a6d3154878077466f8064a3895bb1b38616cfdef53b174679d42796d8
+
+ADD --checksum=sha256:${SRB_SHA} \
+    https://github.com/doktor83/SRBMiner-Multi/releases/download/${SRB_VER}/SRBMiner-Multi-3-7-5-Linux.tar.gz /tmp/srb.tgz
+ADD --checksum=sha256:${KRIG_SHA} \
+    https://github.com/kryptex/krig-miner/releases/download/v${KRIG_VER}/krig-miner-${KRIG_VER}-linux-x64.tar.gz /tmp/krig.tgz
+
+# clinfo + OpenCL ICD loader: SRBMiner's AMD backend is unverified and may dlopen libOpenCL.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 ca-certificates tini clinfo ocl-icd-libopencl1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /opt/srb /opt/krig \
+ && tar -xzf /tmp/srb.tgz -C /opt/srb --strip-components=1 \
+ && tar -xzf /tmp/krig.tgz -C /opt/krig --strip-components=1 \
+ && ln -s /opt/srb/SRBMiner-MULTI /usr/local/bin/SRBMiner-MULTI \
+ && rm /tmp/srb.tgz /tmp/krig.tgz \
+ && test -x /opt/krig/krig-miner && test -x /opt/srb/SRBMiner-MULTI && command -v rocminfo
+
+COPY agent.py workername.py prefetch.py /opt/node/
+COPY drivers/ /opt/node/drivers/
+
+ENV PYTHONUNBUFFERED=1 \
+    PM_NODE_ARCH=amd \
+    PEARL_GPU_VENDOR=amd
+LABEL org.opencontainers.image.source="https://github.com/nmatare/pearl_mining" pm.srbminer="${SRB_VER}" pm.krig="${KRIG_VER}" pm.arch="amd"
+
+ENTRYPOINT ["/usr/bin/tini", "--", "python3", "/opt/node/agent.py"]
