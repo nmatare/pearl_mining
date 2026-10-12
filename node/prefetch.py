@@ -77,16 +77,24 @@ def _get(url: str, headers: dict | None = None, timeout: float = 60) -> bytes:
 # ---------------------------------------------------------------------------------------------------------------
 # ranged download
 # ---------------------------------------------------------------------------------------------------------------
-def probe_size(url: str, headers: dict | None = None) -> int:
-    """Total size through a 1-byte ranged GET (works through redirects and on CDNs that answer HEAD badly)."""
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-0", **(headers or {})})
-    with urlopen(req, 60) as r:
-        cr = r.headers.get("Content-Range", "")
-        m = re.search(r"/(\d+)\s*$", cr)
-        if r.status == 206 and m:
-            return int(m.group(1))
-        if r.status == 200 and r.headers.get("Content-Length"):
-            raise RangeUnsupported("server ignores Range")
+def probe_size(url: str, headers: dict | None = None, tries: int = 5) -> int:
+    """Total size through a 1-byte ranged GET (works through redirects and on CDNs that answer HEAD badly). Cloudflare in front of
+    updates.dphn.ai answers about one range request in five with a plain 200 (seen live), so a 200 is retried before it counts as
+    "server ignores Range"."""
+    ignored = False
+    for i in range(max(1, tries)):
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-0", **(headers or {})})
+        with urlopen(req, 60) as r:
+            cr = r.headers.get("Content-Range", "")
+            m = re.search(r"/(\d+)\s*$", cr)
+            if r.status == 206 and m:
+                return int(m.group(1))
+            if r.status == 200 and r.headers.get("Content-Length"):
+                ignored = True
+        if ignored and i + 1 < tries:
+            time.sleep(0.5)
+    if ignored:
+        raise RangeUnsupported("server ignores Range")
     raise PrefetchError("cannot read the size")
 
 
