@@ -34,6 +34,8 @@ No requests right now is NOT a failure: that is a connected worker with load 0 (
 Env: DOLPHIN_HOME (config mode: HOME for the worker, default /var/lib/dolphin; config in <home>/config, caches in <home>/cache),
 DOLPHIN_WORKER_BINARY_URL, DOLPHIN_CHECKSUMS_URL, DOLPHIN_FRESH_MACHINE_ID (default 1), DOLPHIN_SONAR_SOCKET (glob of
 the worker's local engine socket, default /tmp/dp-*/v.sock: load is read from its /metrics),
+DOLPHIN_GPU_IDS (config mode: comma-separated nvidia-smi indices written to worker.json `gpu_ids`, so the worker forms its tensor-parallel
+group on those GPUs only and the miner keeps the rest; the controller sets it when a machine has more GPUs than one group),
 DOLPHIN_PREFETCH (default 1; 0 = let the worker download), DOLPHIN_MODEL (explicit model id; else the config's `model`,
 and for "auto" DOLPHIN_AUTO_MODEL, default unsloth/Qwen3.8-27B-NVFP4), DOLPHIN_MODEL_REVISION (main), DOLPHIN_RUNTIME_URL
 (the runtime bundle), DOLPHIN_PREFETCH_WAIT_S (600: how long the worker start waits for the prefetch), HF_ENDPOINT, HF_TOKEN,
@@ -367,6 +369,9 @@ class Driver(ProcessDriver):
                 pick = (env.get("DOLPHIN_MODEL") or "").strip()  # the controller's pick for this card (networks/dolphin.py)
                 if pick and pick.lower() != "auto":
                     self.config["model"] = pick
+                ids = [int(x) for x in (env.get("DOLPHIN_GPU_IDS") or "").replace(" ", "").split(",") if x.isdigit()]
+                if ids:  # the controller's tensor-parallel group of this machine; the other GPUs mine Pearl
+                    self.config["gpu_ids"] = ids
                 self.kind = "config"
                 if "DOLPHIN_CONNECT_TIMEOUT_S" not in env:  # runtime bundle + model download: far longer than a link install
                     self.connect_timeout_s = 3600.0
